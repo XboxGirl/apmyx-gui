@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar,
                              QPushButton, QMessageBox, QDialog, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QDialogButtonBox, QPlainTextEdit)
+                             QTableWidgetItem, QHeaderView, QDialogButtonBox, QPlainTextEdit,
+                             QSizePolicy)
 from PyQt6.QtCore import (Qt, pyqtSlot, QThreadPool, pyqtSignal, QTimer, QPropertyAnimation,
                           QEasingCurve, pyqtProperty, QBuffer, QIODevice, QRectF)
 from PyQt6.QtGui import (QPixmap, QIcon, QFontMetrics, QImageReader, QColorSpace, QPainter,
@@ -58,21 +59,35 @@ class ElidedLabel(QLabel):
     def __init__(self, text="", parent=None):
         super().__init__(parent)
         self._text = text
-        self.setWordWrap(True)  
+        self._elided_text = None
+        self._update_pending = False
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.updateText()
 
     def setText(self, text):
+        if text == self._text:
+            return
         self._text = text
         self.updateText()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.updateText()
+        self.scheduleUpdateText()
+
+    def scheduleUpdateText(self):
+        if self._update_pending:
+            return
+        self._update_pending = True
+        QTimer.singleShot(0, self.updateText)
 
     def updateText(self):
+        self._update_pending = False
         metrics = QFontMetrics(self.font())
-        elided = metrics.elidedText(self._text, Qt.TextElideMode.ElideRight, self.width())
-        super().setText(elided)
+        elided = metrics.elidedText(self._text, Qt.TextElideMode.ElideRight, max(0, self.width()))
+        if elided != self._elided_text:
+            self._elided_text = elided
+            super().setText(elided)
 
 PROGRESS_BAR_STYLESHEET = """
 QProgressBar {
@@ -217,10 +232,13 @@ class DownloadJobWidget(QWidget):
         top_row_layout.addLayout(counts_layout)
         
         self.status_label = QLabel("Queued...")
-        self.status_label.setWordWrap(True)
+        self.status_label.setWordWrap(False)
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.status_label.setStyleSheet("font-size: 8pt;")
         
         self.stream_label = QLabel("Stream: —")
+        self.stream_label.setWordWrap(False)
+        self.stream_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.stream_label.setStyleSheet("color: #bbb; font-size: 8pt;")
         
         info_layout.addLayout(top_row_layout)

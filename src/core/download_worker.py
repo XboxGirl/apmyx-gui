@@ -7,7 +7,6 @@ import sys
 import time
 import threading
 import yaml
-from queue import Empty, Queue
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QRunnable, QThreadPool
 
@@ -117,9 +116,6 @@ class DownloadJobRunner(QRunnable):
             self.signals.stream_label.emit(self.job_id, dimension_str)
             return
 
-        log_prefix = "[Go Backend ERR]" if is_stderr else "[Go Backend]"
-        logging.info(f"{log_prefix} {msg}")
-
         if is_stderr:
             if self._is_decryptor_connection_failure(msg):
                 logging.warning(f"PAUSE TRIGGER: Detected decryptor connection failure for job {self.job_id}.")
@@ -128,6 +124,7 @@ class DownloadJobRunner(QRunnable):
                 return
 
             if not any(p.match(msg) for p in self.info_stderr_patterns):
+                logging.warning(f"[Go Backend ERR] {msg}")
                 self.error_lines.append(msg)
                 self.signals.error_line.emit(self.job_id, msg)
 
@@ -350,7 +347,7 @@ class DownloadJobRunner(QRunnable):
             process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
@@ -359,53 +356,23 @@ class DownloadJobRunner(QRunnable):
 
             self.worker_ref.set_current_process(process)
             self.started_at = time.monotonic()
-            output_queue = Queue()
 
-            def stream_reader(stream, is_stderr):
-                for line in iter(stream.readline, ''):
-                    if self.worker_ref.was_terminated_intentionally and process.poll() is not None:
-                        break
-                    if self._pause_triggered:
-                        break
-                    output_queue.put((line, is_stderr))
-                stream.close()
-
-            stdout_thread = threading.Thread(target=stream_reader, args=(process.stdout, False), daemon=True)
-            stderr_thread = threading.Thread(target=stream_reader, args=(process.stderr, True), daemon=True)
-
-            stdout_thread.start()
-            stderr_thread.start()
-
-            return_code = None
-            while return_code is None:
-                try:
-                    line, is_stderr = output_queue.get(timeout=0.1)
-                    self.process_line(line, is_stderr)
-                except Empty:
-                    pass
-                return_code = process.poll()
-
-            while True:
-                try:
-                    line, is_stderr = output_queue.get_nowait()
-                    self.process_line(line, is_stderr)
-                except Empty:
+            for line in iter(process.stdout.readline, ''):
+                msg = line.lstrip()
+                is_backend_message = not msg.startswith("AMDL_PROGRESS::")
+                self.process_line(line, is_backend_message)
+                if self.worker_ref.was_terminated_intentionally and process.poll() is not None:
                     break
+                if self._pause_triggered:
+                    break
+
+            process.stdout.close()
+            return_code = process.wait()
 
             if self._pause_triggered:
        
                 return
 
-            if not self.worker_ref.was_terminated_intentionally:
-                stdout_thread.join(timeout=2)
-                stderr_thread.join(timeout=2)
-
-                while True:
-                    try:
-                        line, is_stderr = output_queue.get_nowait()
-                        self.process_line(line, is_stderr)
-                    except Empty:
-                        break
 
             with self._progress_lock:
                 if self._latest_progress_data:

@@ -119,6 +119,11 @@ def setup_logging():
 
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
+
+    # Remove any handlers configured by imported modules to avoid duplicate lines.
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+
     root_logger.addHandler(console_handler)
 
     def handle_exception(exc_type, exc_value, exc_traceback):

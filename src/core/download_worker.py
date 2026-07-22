@@ -77,6 +77,10 @@ class DownloadJobRunner(QRunnable):
             re.compile(r"^Download(ing|ed)"),
             re.compile(r"^Decrypt(ing|ed)"),
             re.compile(r"^\[CONFIG\] "),
+            re.compile(r"^failed to get lyrics$", re.IGNORECASE),
+            re.compile(r"^no synchronised lyrics$", re.IGNORECASE),
+            re.compile(r"^Failed to write lyrics$", re.IGNORECASE),
+            re.compile(r"^Warning: Failed to embed lyrics in FLAC:"),
         ]
 
     def _is_decryptor_connection_failure(self, line: str) -> bool:

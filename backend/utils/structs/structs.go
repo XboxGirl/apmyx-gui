@@ -15,6 +15,8 @@ type ConfigSet struct {
 	SaveArtistCover                     bool   `yaml:"save-artist-cover" json:"save-artist-cover"`
 	CoverSize                           string `yaml:"cover-size" json:"cover-size"`
 	CoverFormat                         string `yaml:"cover-format" json:"cover-format"`
+	FlacOutput                          bool   `yaml:"flac-output" json:"flac-output"`
+	FlacCompressionLevel                int    `yaml:"flac-compression-level" json:"flac-compression-level"`
 	AlacSaveFolder                      string `yaml:"alac-save-folder" json:"alac-save-folder"`
 	AtmosSaveFolder                     string `yaml:"atmos-save-folder" json:"atmos-save-folder"`
 	AacSaveFolder                       string `yaml:"aac-save-folder" json:"aac-save-folder"`
@@ -41,6 +43,10 @@ type ConfigSet struct {
 	DlAlbumcoverForPlaylist             bool   `yaml:"dl-albumcover-for-playlist" json:"dl-albumcover-for-playlist"`
 	MVAudioType                         string `yaml:"mv-audio-type" json:"mv-audio-type"`
 	MVMax                               int    `yaml:"mv-max" json:"mv-max"`
+	Mp4boxPath                          string `yaml:"mp4box-path" json:"mp4box-path"`
+	FfmpegPath                          string `yaml:"ffmpeg-path" json:"ffmpeg-path"`
+	MetaflacPath                        string `yaml:"metaflac-path" json:"metaflac-path"`
+	Mp4decryptPath                      string `yaml:"mp4decrypt-path" json:"mp4decrypt-path"`
 	TagOptions                          struct {
 		WriteTitle           bool `yaml:"write-title" json:"write-title"`
 		WriteArtist          bool `yaml:"write-artist" json:"write-artist"`

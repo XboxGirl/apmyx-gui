@@ -7,6 +7,7 @@ import sys
 import time
 import threading
 import yaml
+from queue import Empty, Queue
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QRunnable, QThreadPool
 
@@ -76,6 +77,7 @@ class DownloadJobRunner(QRunnable):
             re.compile(r"^MV Remuxed."),
             re.compile(r"^Download(ing|ed)"),
             re.compile(r"^Decrypt(ing|ed)"),
+            re.compile(r"^\[CONFIG\] "),
         ]
 
     def _is_decryptor_connection_failure(self, line: str) -> bool:
@@ -326,6 +328,21 @@ class DownloadJobRunner(QRunnable):
                 overall_progress = ((self.completed_tracks * 100.0) + track_progress) / float(self.total_tracks)
                 self._emit_progress(status_text, track_progress, overall_progress)
 
+    @staticmethod
+    def sanitized_command(command):
+        sensitive_flags = {'--media-user-token', '--authorization-token'}
+        sanitized = []
+        redact_next = False
+        for arg in command:
+            if redact_next:
+                sanitized.append('<redacted>' if arg else '<empty>')
+                redact_next = False
+                continue
+            sanitized.append(arg)
+            if arg in sensitive_flags:
+                redact_next = True
+        return sanitized
+
     @pyqtSlot()
     def run(self):
         try:
@@ -342,7 +359,7 @@ class DownloadJobRunner(QRunnable):
 
             self.worker_ref.set_current_process(process)
             self.started_at = time.monotonic()
-            output_lock = threading.Lock()
+            output_queue = Queue()
 
             def stream_reader(stream, is_stderr):
                 for line in iter(stream.readline, ''):
@@ -350,8 +367,7 @@ class DownloadJobRunner(QRunnable):
                         break
                     if self._pause_triggered:
                         break
-                    with output_lock:
-                        self.process_line(line, is_stderr)
+                    output_queue.put((line, is_stderr))
                 stream.close()
 
             stdout_thread = threading.Thread(target=stream_reader, args=(process.stdout, False), daemon=True)
@@ -360,7 +376,21 @@ class DownloadJobRunner(QRunnable):
             stdout_thread.start()
             stderr_thread.start()
 
-            return_code = process.wait()
+            return_code = None
+            while return_code is None:
+                try:
+                    line, is_stderr = output_queue.get(timeout=0.1)
+                    self.process_line(line, is_stderr)
+                except Empty:
+                    pass
+                return_code = process.poll()
+
+            while True:
+                try:
+                    line, is_stderr = output_queue.get_nowait()
+                    self.process_line(line, is_stderr)
+                except Empty:
+                    break
 
             if self._pause_triggered:
        
@@ -369,6 +399,13 @@ class DownloadJobRunner(QRunnable):
             if not self.worker_ref.was_terminated_intentionally:
                 stdout_thread.join(timeout=2)
                 stderr_thread.join(timeout=2)
+
+                while True:
+                    try:
+                        line, is_stderr = output_queue.get_nowait()
+                        self.process_line(line, is_stderr)
+                    except Empty:
+                        break
 
             with self._progress_lock:
                 if self._latest_progress_data:
@@ -586,7 +623,8 @@ class DownloadWorker(QObject):
                 command.append("--song")
             command.append(url_to_download)
 
-            logging.info(f"Executing Go backend with command: {' '.join(command)}")
+            sanitized_command = DownloadJobRunner.sanitized_command(command)
+            logging.info(f"Executing Go backend with command: {' '.join(sanitized_command)}")
 
             runner = DownloadJobRunner(
                 job['job_id'], 

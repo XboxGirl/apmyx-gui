@@ -65,8 +65,8 @@ type MusicVideoItem struct {
 }
 
 type AlbumAttributes struct {
-	ArtistName    string `json:"artistName"`
-	Artwork       struct {
+	ArtistName string `json:"artistName"`
+	Artwork    struct {
 		URL string `json:"url"`
 	} `json:"artwork"`
 	IsCompilation bool   `json:"isCompilation"`
@@ -78,8 +78,8 @@ type AlbumAttributes struct {
 }
 
 type MusicVideoAttributes struct {
-	ArtistName       string `json:"artistName"`
-	Artwork          struct {
+	ArtistName string `json:"artistName"`
+	Artwork    struct {
 		URL string `json:"url"`
 	} `json:"artwork"`
 	Name             string `json:"name"`
@@ -1049,9 +1049,9 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, discTrackC
 		flacPath := strings.TrimSuffix(trackPath, ".m4a") + ".flac"
 
 		fmt.Fprintln(os.Stderr, "Transcoding to FLAC...")
-	transcodeCmd := exec.Command(Config.FfmpegPath, "-y", "-i", trackPath, "-c:a", "flac", "-compression_level", fmt.Sprintf("%d", Config.FlacCompressionLevel), flacPath)
-	if err := runCommand("ffmpeg-flac", transcodeCmd); err != nil {
-		fmt.Fprintf(os.Stderr, "FLAC transcoding failed: %v\n", err)
+		transcodeCmd := exec.Command(Config.FfmpegPath, "-y", "-i", trackPath, "-c:a", "flac", "-compression_level", fmt.Sprintf("%d", Config.FlacCompressionLevel), flacPath)
+		if err := runCommand("ffmpeg-flac", transcodeCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "FLAC transcoding failed: %v\n", err)
 			counter.Error++
 			return
 		}
@@ -1421,10 +1421,10 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 			if err == nil {
 				exists, _ := fileExists(filepath.Join(playlistFolderPath, "squareanimatedartwork.mp4"))
 				if !exists {
-                    cmd := exec.Command(Config.FfmpegPath, "-loglevel", "quiet", "-y", "-i",
-                        motionvideoUrlSquare, "-c", "copy",
-                        filepath.Join(playlistFolderPath, "squareanimatedartwork.mp4"))
-                    runCommand("ffmpeg-anim-square", cmd)
+					cmd := exec.Command(Config.FfmpegPath, "-loglevel", "quiet", "-y", "-i",
+						motionvideoUrlSquare, "-c", "copy",
+						filepath.Join(playlistFolderPath, "squareanimatedartwork.mp4"))
+					runCommand("ffmpeg-anim-square", cmd)
 				}
 			}
 		}
@@ -2040,22 +2040,20 @@ func writeFlacTags(flacPath string, track *task.Track, lrc string, coverPath str
 
 	tagsContent := strings.Join(tags, "\n")
 	cmd := exec.Command(Config.MetaflacPath, "--import-tags-from=-", flacPath)
-	cmd.Stdin = strings.NewReader(tagsContent)
-	if err := cmd.Run(); err != nil {
+	if err := runCommandStdin("metaflac-tags", cmd, tagsContent); err != nil {
 		return err
 	}
 
 	if coverPath != "" {
 		coverCmd := exec.Command(Config.MetaflacPath, "--import-picture-from="+coverPath, flacPath)
-		if err := coverCmd.Run(); err != nil {
+		if err := runCommand("metaflac-cover", coverCmd); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to embed cover in FLAC: %v\n", err)
 		}
 	}
 
 	if lrc != "" {
 		lrcCmd := exec.Command(Config.MetaflacPath, "--import-tags-from=-", flacPath)
-		lrcCmd.Stdin = strings.NewReader("LYRICS:" + lrc)
-		if err := lrcCmd.Run(); err != nil {
+		if err := runCommandStdin("metaflac-lyrics", lrcCmd, "LYRICS:"+lrc); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to embed lyrics in FLAC: %v\n", err)
 		}
 	}

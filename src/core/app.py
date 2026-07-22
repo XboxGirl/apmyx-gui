@@ -806,6 +806,8 @@ class AppController(QObject):
                     homepage_res = self.session.get(f'https://music.apple.com/{self.storefront}/browse', timeout=20)
                     homepage_res.raise_for_status()
                     match = re.search(r'/assets/index-legacy[~-][^/"]+\.js', homepage_res.text)
+                    if not match:
+                        match = re.search(r'/assets/index~[^/]+\.js', homepage_res.text)
                     if not match: raise ValueError("Could not find core JS file.")
                     js_url = f"https://music.apple.com{match.group(0)}"
                     js_res = self.session.get(js_url, timeout=20)

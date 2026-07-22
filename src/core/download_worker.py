@@ -130,7 +130,6 @@ class DownloadJobRunner(QRunnable):
             if not any(p.match(msg) for p in self.info_stderr_patterns):
                 logging.warning(f"[Go Backend ERR] {msg}")
                 self.error_lines.append(msg)
-                self.signals.error_line.emit(self.job_id, msg)
 
         if msg.startswith("AMDL_PROGRESS::"):
             self.saw_progress = True

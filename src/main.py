@@ -4,6 +4,65 @@ import logging
 import os
 import traceback
 import atexit
+import datetime
+import faulthandler
+import signal
+
+FAULT_LOG_HANDLE = None
+
+
+def setup_fault_diagnostics():
+    """Enable crash diagnostics early enough to catch native segfaults.
+
+    The container mounts /config, so writing there keeps the faulthandler dump
+    available after the app process exits and supervisor tears the service down.
+    """
+    global FAULT_LOG_HANDLE
+
+    log_dir = os.environ.get("APMYX_CRASH_LOG_DIR", "/config/apmyx-runtime/log")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    pid = os.getpid()
+
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"python-faulthandler-{timestamp}-{pid}.log")
+        FAULT_LOG_HANDLE = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+        FAULT_LOG_HANDLE.write(f"[faulthandler] pid={pid} log={log_path}\n")
+        FAULT_LOG_HANDLE.flush()
+        faulthandler.enable(file=FAULT_LOG_HANDLE, all_threads=True)
+    except Exception as exc:
+        log_path = None
+        print(f"[faulthandler] failed to open persistent fault log: {exc}", file=sys.stderr, flush=True)
+        faulthandler.enable(all_threads=True)
+
+    for signal_name in ("SIGUSR1", "SIGUSR2"):
+        dump_signal = getattr(signal, signal_name, None)
+        if dump_signal is None:
+            continue
+        try:
+            if FAULT_LOG_HANDLE is not None:
+                faulthandler.register(dump_signal, file=FAULT_LOG_HANDLE, all_threads=True, chain=False)
+            else:
+                faulthandler.register(dump_signal, all_threads=True, chain=False)
+        except Exception as exc:
+            print(f"[faulthandler] failed to register {signal_name}: {exc}", file=sys.stderr, flush=True)
+
+    return log_path
+
+
+def close_fault_log():
+    global FAULT_LOG_HANDLE
+    if FAULT_LOG_HANDLE is not None:
+        try:
+            FAULT_LOG_HANDLE.flush()
+            FAULT_LOG_HANDLE.close()
+        finally:
+            FAULT_LOG_HANDLE = None
+
+
+FAULT_LOG_PATH = setup_fault_diagnostics()
+atexit.register(close_fault_log)
+
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QSettings
 from PyQt6.QtGui import QFontDatabase, QFont, QIcon
@@ -14,8 +73,6 @@ from ui.main_window.dialogs import UpdateDialog
 
 APP_FONT_FAMILY = "Inter Tight"
 APP_FALLBACK_FONTS = '"Segoe UI", "Helvetica Neue", "Arial", sans-serif'
-APP_FONT = QFont(APP_FONT_FAMILY, 9)
-
 APP_FONT = QFont(APP_FONT_FAMILY, 9)
 
 APP_FONT.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
@@ -191,7 +248,9 @@ if __name__ == "__main__":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     setup_logging()
-    
+    if FAULT_LOG_PATH:
+        logging.info(f"Python faulthandler crash log: {FAULT_LOG_PATH}")
+
     app = QApplication(sys.argv)
     
     app.setOrganizationName("rwnk-12")

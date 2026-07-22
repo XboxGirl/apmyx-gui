@@ -878,6 +878,10 @@ class AppController(QObject):
     def _search_api(self, query: str, types: str, limit: int, offset: int = 0) -> dict:
         if self._shutdown:
             raise ValueError("Controller is shutting down")
+
+        query = str(query or '').strip()
+        if not query:
+            raise ValueError("Search query is empty.")
             
         token = self._get_apple_music_dev_token()
         if not token:

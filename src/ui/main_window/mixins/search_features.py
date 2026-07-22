@@ -58,6 +58,9 @@ class SearchFeatures:
             return
         if self.is_loading_more.get(category) or self.no_more_results.get(category):
             return
+        query = (self.current_query or '').strip()
+        if not query:
+            return
         scrollbar = self.scroll_areas[category].verticalScrollBar()
         if value >= scrollbar.maximum() - 150:
             self.is_loading_more[category] = True
@@ -79,7 +82,7 @@ class SearchFeatures:
                     self.loading_tile.start()
             offset = self.search_offsets.get(category, 0) + 30
             self.search_offsets[category] = offset
-            self.controller.load_more_results(self.current_query, category, offset)
+            self.controller.load_more_results(query, category, offset)
 
     def on_search_clicked(self):
         if not self._ensure_storefront_or_prompt():
@@ -127,6 +130,10 @@ class SearchFeatures:
 
     def on_tab_changed(self, index):
         tab_text = self.tab_widget.tabText(index)
+        query = (self.current_query or '').strip()
+        if tab_text in {"Albums", "Music Videos", "Playlists"} and not query:
+            self._update_view_toggle_button()
+            return
         if tab_text == "Albums" and not self.albums_tab_searched:
             self.albums_tab_searched = True
             container = self.tab_containers['albums']
@@ -137,7 +144,7 @@ class SearchFeatures:
             layout.addWidget(spinner, 0, Qt.AlignmentFlag.AlignCenter)
             spinner.start()
             self.loading_spinners['albums'] = spinner
-            self.controller.search_for_albums(self.current_query)
+            self.controller.search_for_albums(query)
         elif tab_text == "Music Videos" and not self.music_videos_tab_searched:
             self.music_videos_tab_searched = True
             container = self.tab_containers['music_videos']
@@ -148,7 +155,7 @@ class SearchFeatures:
             layout.addWidget(spinner, 0, Qt.AlignmentFlag.AlignCenter)
             spinner.start()
             self.loading_spinners['music_videos'] = spinner
-            self.controller.search_for_music_videos(self.current_query)
+            self.controller.search_for_music_videos(query)
         elif tab_text == "Playlists" and not self.playlists_tab_searched:
             self.playlists_tab_searched = True
             container = self.tab_containers['playlists']
@@ -159,7 +166,7 @@ class SearchFeatures:
             layout.addWidget(spinner, 0, Qt.AlignmentFlag.AlignCenter)
             spinner.start()
             self.loading_spinners['playlists'] = spinner
-            self.controller.search_for_playlists(self.current_query)
+            self.controller.search_for_playlists(query)
         self._update_view_toggle_button()
 
     def _populate_top_results_tab(self, results):

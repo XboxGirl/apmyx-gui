@@ -8,11 +8,11 @@ import requests
 import threading
 import traceback
 import base64
-import concurrent.futures
 import asyncio
 import aiohttp
 import time
 import yaml
+from typing import Callable, Optional
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QRunnable, QThreadPool, QEventLoop
 from requests.adapters import HTTPAdapter
 from mutagen import File, MutagenError
@@ -25,7 +25,6 @@ try:
 except ImportError:
     Opus = None
 
-from models.track import Album, Track
 from xml.dom import minidom
 from xml.etree import ElementTree
 import datetime
@@ -249,6 +248,88 @@ class AppController(QObject):
         if level == 'info': logging.info(message)
         elif level == 'error': logging.error(message)
         self.status_updated.emit(message)
+
+    def _run_backend_json_output(
+        self,
+        url: str,
+        job_id: int = 0,
+        progress_handler: Optional[Callable] = None,
+    ):
+        """Run the backend metadata fetcher without auxiliary reader threads.
+
+        Older versions read stdout/stderr from daemon Python threads and emitted Qt
+        signals from those ad-hoc threads. Keeping all parsing and signal emission
+        in the existing QRunnable worker context avoids that crash-prone pattern.
+        """
+        command = [self.downloader_executable, "--json-output", url]
+        process = None
+        output_lines = []
+        probe_total = None
+        inside_json_block = False
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            with self.process_lock:
+                self.active_processes.append(process)
+                if job_id > 0:
+                    self.fetching_processes[job_id] = (process, url)
+
+            if process.stdout is not None:
+                for line in iter(process.stdout.readline, ''):
+                    if not line:
+                        break
+                    output_lines.append(line)
+                    msg = line.strip()
+                    if not msg:
+                        continue
+
+                    starts_json = "AMDL_JSON_START" in msg
+                    ends_json = "AMDL_JSON_END" in msg
+                    if starts_json:
+                        inside_json_block = True
+
+                    if msg.startswith("AMDL_PROGRESS::"):
+                        try:
+                            data = json.loads(msg[len("AMDL_PROGRESS::"):].strip())
+                            progress_type = data.get("type")
+                            if progress_type == "probe_start":
+                                probe_total = int(data.get("total", 0))
+                            if progress_handler:
+                                progress_handler(data, probe_total)
+                        except Exception:
+                            logging.debug("Ignoring malformed backend progress line: %s", msg, exc_info=True)
+                    elif not inside_json_block and not starts_json and not ends_json:
+                        self.status_updated.emit(msg)
+
+                    if ends_json:
+                        inside_json_block = False
+
+            return_code = process.wait()
+
+            with self.process_lock:
+                cancelled = job_id > 0 and job_id not in self.fetching_processes
+
+            return return_code, "".join(output_lines), cancelled
+        finally:
+            try:
+                if process and process.stdout:
+                    process.stdout.close()
+            except Exception:
+                pass
+            with self.process_lock:
+                if job_id > 0:
+                    self.fetching_processes.pop(job_id, None)
+                if process and process in self.active_processes:
+                    self.active_processes.remove(process)
 
     def fetch_media_for_download(self, url: str, job_id: int):
         self.update_status_and_log(f"Fetching... for: {url}...")
@@ -503,65 +584,25 @@ class AppController(QObject):
             self.video_details_for_preview_loaded.emit(video_data)
 
     def _fetch_media_generic_worker(self, url: str, signal_to_emit):
-        command = [self.downloader_executable, "--json-output", url]
-        process = None
         try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            )
-            with self.process_lock:
-                self.active_processes.append(process)
+            def progress_handler(data, probe_total):
+                t = data.get("type")
+                if t == "probe_start":
+                    self.status_updated.emit(f"Fetching... (0/{probe_total or 0})")
+                elif t == "probe_progress":
+                    cur = int(data.get("current", 0))
+                    tot = int(data.get("total", probe_total or 0))
+                    self.status_updated.emit(f"Fetching... ({cur}/{tot})")
 
-            stdout_buf = []
-            probe_total = None
-
-            def stdout_reader():
-                nonlocal probe_total
-                for line in iter(process.stdout.readline, ''):
-                    if not line: break
-                    msg = line.strip()
-                    if msg.startswith("AMDL_PROGRESS::"):
-                        try:
-                            data = json.loads(msg[len("AMDL_PROGRESS::"):].strip())
-                            t = data.get("type")
-                            if t == "probe_start":
-                                probe_total = int(data.get("total", 0))
-                                self.status_updated.emit(f"Fetching... (0/{probe_total})")
-                            elif t == "probe_progress":
-                                cur = int(data.get("current", 0))
-                                tot = int(data.get("total", probe_total or 0))
-                                self.status_updated.emit(f"Fetching... ({cur}/{tot})")
-                        except Exception:
-                            pass
-                    stdout_buf.append(line)
-
-            def stderr_reader():
-                for line in iter(process.stderr.readline, ''):
-                    if not line: break
-                    self.status_updated.emit(line.strip())
-
-            t_out = threading.Thread(target=stdout_reader, daemon=True)
-            t_err = threading.Thread(target=stderr_reader, daemon=True)
-            t_out.start()
-            t_err.start()
-
-            return_code = process.wait()
-            t_out.join()
-            t_err.join()
+            return_code, full_out, cancelled = self._run_backend_json_output(url, progress_handler=progress_handler)
+            if cancelled:
+                return
 
             if return_code != 0:
                 self.update_status_and_log(f"Error fetching details.", 'error')
                 signal_to_emit.emit({})
                 return
 
-            full_out = "".join(stdout_buf)
             json_match = re.search(r'AMDL_JSON_START(.*)AMDL_JSON_END', full_out, re.DOTALL)
             if not json_match:
                 self.update_status_and_log("Error: Could not parse details data.", 'error')
@@ -574,71 +615,26 @@ class AppController(QObject):
         except Exception as e:
             self.update_status_and_log(f"Failed to execute Go backend for details: {e}", 'error')
             signal_to_emit.emit({})
-        finally:
-            with self.process_lock:
-                if process and process in self.active_processes:
-                    self.active_processes.remove(process)
 
     def _fetch_media_worker(self, url: str, job_id: int):
-        command = [self.downloader_executable, "--json-output", url]
-        process = None
         try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            def progress_handler(data, probe_total):
+                t = data.get("type")
+                if t == "probe_start":
+                    self.media_fetch_progress.emit(job_id, 0, probe_total or 0)
+                elif t == "probe_progress":
+                    cur = int(data.get("current", 0))
+                    tot = int(data.get("total", probe_total or 0))
+                    self.media_fetch_progress.emit(job_id, cur, tot)
+
+            return_code, full_out, cancelled = self._run_backend_json_output(
+                url,
+                job_id=job_id,
+                progress_handler=progress_handler,
             )
-            with self.process_lock:
-                self.active_processes.append(process)
-                if job_id > 0:
-                    self.fetching_processes[job_id] = (process, url)
-
-            stdout_buf = []
-            probe_total = None
-
-            def stdout_reader():
-                nonlocal probe_total
-                for line in iter(process.stdout.readline, ''):
-                    if not line: break
-                    msg = line.strip()
-                    if msg.startswith("AMDL_PROGRESS::"):
-                        try:
-                            data = json.loads(msg[len("AMDL_PROGRESS::"):].strip())
-                            t = data.get("type")
-                            if t == "probe_start":
-                                probe_total = int(data.get("total", 0))
-                                self.media_fetch_progress.emit(job_id, 0, probe_total)
-                            elif t == "probe_progress":
-                                cur = int(data.get("current", 0))
-                                tot = int(data.get("total", probe_total or 0))
-                                self.media_fetch_progress.emit(job_id, cur, tot)
-                        except Exception:
-                            pass
-                    stdout_buf.append(line)
-
-            def stderr_reader():
-                for line in iter(process.stderr.readline, ''):
-                    if not line: break
-                    self.status_updated.emit(line.strip())
-
-            t_out = threading.Thread(target=stdout_reader, daemon=True)
-            t_err = threading.Thread(target=stderr_reader, daemon=True)
-            t_out.start()
-            t_err.start()
-
-            return_code = process.wait()
-            t_out.join()
-            t_err.join()
-
-            with self.process_lock:
-                if job_id > 0 and job_id not in self.fetching_processes:
-                    logging.info(f"Fetch for job {job_id} was cancelled. Aborting post-processing.")
-                    return
+            if cancelled:
+                logging.info(f"Fetch for job {job_id} was cancelled. Aborting post-processing.")
+                return
 
             if return_code != 0:
                 error_message = f"Failed to fetch media. See console for details."
@@ -646,7 +642,6 @@ class AppController(QObject):
                 self.media_fetch_failed.emit(job_id, url, error_message)
                 return
 
-            full_out = "".join(stdout_buf)
             json_match = re.search(r'AMDL_JSON_START(.*)AMDL_JSON_END', full_out, re.DOTALL)
             if not json_match:
                 self.update_status_and_log(f"Error: Could not find metadata JSON for {url}.", 'error')
@@ -663,12 +658,6 @@ class AppController(QObject):
         except Exception as e:
             self.update_status_and_log(f"Failed to execute Go backend for {url}: {e}", 'error')
             self.media_fetch_failed.emit(job_id, url, f"Execution error: {e}")
-        finally:
-            with self.process_lock:
-                if job_id > 0:
-                    self.fetching_processes.pop(job_id, None)
-                if process and process in self.active_processes:
-                    self.active_processes.remove(process)
 
     def search(self, query: str):
         self.update_status_and_log(f"Searching for: '{query}'...")
@@ -806,6 +795,8 @@ class AppController(QObject):
                     homepage_res = self.session.get(f'https://music.apple.com/{self.storefront}/browse', timeout=20)
                     homepage_res.raise_for_status()
                     match = re.search(r'/assets/index-legacy[~-][^/"]+\.js', homepage_res.text)
+                    if not match:
+                        match = re.search(r'/assets/index~[^/]+\.js', homepage_res.text)
                     if not match: raise ValueError("Could not find core JS file.")
                     js_url = f"https://music.apple.com{match.group(0)}"
                     js_res = self.session.get(js_url, timeout=20)
@@ -876,6 +867,10 @@ class AppController(QObject):
     def _search_api(self, query: str, types: str, limit: int, offset: int = 0) -> dict:
         if self._shutdown:
             raise ValueError("Controller is shutting down")
+
+        query = str(query or '').strip()
+        if not query:
+            raise ValueError("Search query is empty.")
             
         token = self._get_apple_music_dev_token()
         if not token:

@@ -39,3 +39,9 @@ mv-max: 2160
 storefront: 
 preferred-quality: AAC
 mv-file-format: '{ArtistName} - {VideoName} [{ReleaseYear}]'
+flac-output: false
+flac-compression-level: 12
+mp4box-path: ''
+ffmpeg-path: ''
+metaflac-path: ''
+mp4decrypt-path: ''

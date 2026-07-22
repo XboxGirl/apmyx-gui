@@ -76,6 +76,11 @@ class DownloadJobRunner(QRunnable):
             re.compile(r"^MV Remuxed."),
             re.compile(r"^Download(ing|ed)"),
             re.compile(r"^Decrypt(ing|ed)"),
+            re.compile(r"^\[CONFIG\] "),
+            re.compile(r"^failed to get lyrics$", re.IGNORECASE),
+            re.compile(r"^no synchronised lyrics$", re.IGNORECASE),
+            re.compile(r"^Failed to write lyrics$", re.IGNORECASE),
+            re.compile(r"^Warning: Failed to embed lyrics in FLAC:"),
         ]
 
     def _is_decryptor_connection_failure(self, line: str) -> bool:
@@ -115,9 +120,6 @@ class DownloadJobRunner(QRunnable):
             self.signals.stream_label.emit(self.job_id, dimension_str)
             return
 
-        log_prefix = "[Go Backend ERR]" if is_stderr else "[Go Backend]"
-        logging.info(f"{log_prefix} {msg}")
-
         if is_stderr:
             if self._is_decryptor_connection_failure(msg):
                 logging.warning(f"PAUSE TRIGGER: Detected decryptor connection failure for job {self.job_id}.")
@@ -126,8 +128,8 @@ class DownloadJobRunner(QRunnable):
                 return
 
             if not any(p.match(msg) for p in self.info_stderr_patterns):
+                logging.warning(f"[Go Backend ERR] {msg}")
                 self.error_lines.append(msg)
-                self.signals.error_line.emit(self.job_id, msg)
 
         if msg.startswith("AMDL_PROGRESS::"):
             self.saw_progress = True
@@ -326,6 +328,21 @@ class DownloadJobRunner(QRunnable):
                 overall_progress = ((self.completed_tracks * 100.0) + track_progress) / float(self.total_tracks)
                 self._emit_progress(status_text, track_progress, overall_progress)
 
+    @staticmethod
+    def sanitized_command(command):
+        sensitive_flags = {'--media-user-token', '--authorization-token'}
+        sanitized = []
+        redact_next = False
+        for arg in command:
+            if redact_next:
+                sanitized.append('<redacted>' if arg else '<empty>')
+                redact_next = False
+                continue
+            sanitized.append(arg)
+            if arg in sensitive_flags:
+                redact_next = True
+        return sanitized
+
     @pyqtSlot()
     def run(self):
         try:
@@ -333,7 +350,7 @@ class DownloadJobRunner(QRunnable):
             process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
@@ -342,33 +359,23 @@ class DownloadJobRunner(QRunnable):
 
             self.worker_ref.set_current_process(process)
             self.started_at = time.monotonic()
-            output_lock = threading.Lock()
 
-            def stream_reader(stream, is_stderr):
-                for line in iter(stream.readline, ''):
-                    if self.worker_ref.was_terminated_intentionally and process.poll() is not None:
-                        break
-                    if self._pause_triggered:
-                        break
-                    with output_lock:
-                        self.process_line(line, is_stderr)
-                stream.close()
+            for line in iter(process.stdout.readline, ''):
+                msg = line.lstrip()
+                is_backend_message = not msg.startswith("AMDL_PROGRESS::")
+                self.process_line(line, is_backend_message)
+                if self.worker_ref.was_terminated_intentionally and process.poll() is not None:
+                    break
+                if self._pause_triggered:
+                    break
 
-            stdout_thread = threading.Thread(target=stream_reader, args=(process.stdout, False), daemon=True)
-            stderr_thread = threading.Thread(target=stream_reader, args=(process.stderr, True), daemon=True)
-
-            stdout_thread.start()
-            stderr_thread.start()
-
+            process.stdout.close()
             return_code = process.wait()
 
             if self._pause_triggered:
        
                 return
 
-            if not self.worker_ref.was_terminated_intentionally:
-                stdout_thread.join(timeout=2)
-                stderr_thread.join(timeout=2)
 
             with self._progress_lock:
                 if self._latest_progress_data:
@@ -586,7 +593,8 @@ class DownloadWorker(QObject):
                 command.append("--song")
             command.append(url_to_download)
 
-            logging.info(f"Executing Go backend with command: {' '.join(command)}")
+            sanitized_command = DownloadJobRunner.sanitized_command(command)
+            logging.info(f"Executing Go backend with command: {' '.join(sanitized_command)}")
 
             runner = DownloadJobRunner(
                 job['job_id'], 

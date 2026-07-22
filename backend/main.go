@@ -65,8 +65,8 @@ type MusicVideoItem struct {
 }
 
 type AlbumAttributes struct {
-	ArtistName    string `json:"artistName"`
-	Artwork       struct {
+	ArtistName string `json:"artistName"`
+	Artwork    struct {
 		URL string `json:"url"`
 	} `json:"artwork"`
 	IsCompilation bool   `json:"isCompilation"`
@@ -78,8 +78,8 @@ type AlbumAttributes struct {
 }
 
 type MusicVideoAttributes struct {
-	ArtistName       string `json:"artistName"`
-	Artwork          struct {
+	ArtistName string `json:"artistName"`
+	Artwork    struct {
 		URL string `json:"url"`
 	} `json:"artwork"`
 	Name             string `json:"name"`
@@ -237,6 +237,29 @@ func probeWorker(jobs <-chan ProbeJob, results chan<- TrackProbe, wg *sync.WaitG
 	}
 }
 
+// runCommand runs a command, captures stderr, and logs details on failure (binary path, args, and stderr output).
+func runCommand(label string, cmd *exec.Cmd) error {
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[CMD] %s failed: %v | cmd=%q | args=%v | stderr: %s\n", label, err, cmd.Path, cmd.Args, strings.TrimSpace(stderr.String()))
+	}
+	return err
+}
+
+// runCommandStdin runs a command with stdin input, captures stderr, and logs details on failure.
+func runCommandStdin(label string, cmd *exec.Cmd, stdinData string) error {
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdin = strings.NewReader(stdinData)
+	err := cmd.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[CMD] %s failed: %v | cmd=%q | args=%v | stderr: %s\n", label, err, cmd.Path, cmd.Args, strings.TrimSpace(stderr.String()))
+	}
+	return err
+}
+
 func loadConfig() error {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -265,6 +288,39 @@ func loadConfig() error {
 	if strings.TrimSpace(Config.MvFileFormat) == "" {
 		Config.MvFileFormat = "{ArtistName} - {VideoName}"
 	}
+
+	// resolve binary paths: configured path wins, then env $PATH, then bare name
+	if Config.Mp4boxPath == "" {
+		if p, e := exec.LookPath("MP4Box"); e == nil {
+			Config.Mp4boxPath = p
+		} else {
+			Config.Mp4boxPath = "MP4Box"
+		}
+	}
+	if Config.FfmpegPath == "" {
+		if p, e := exec.LookPath("ffmpeg"); e == nil {
+			Config.FfmpegPath = p
+		} else {
+			Config.FfmpegPath = "ffmpeg"
+		}
+	}
+	if Config.MetaflacPath == "" {
+		if p, e := exec.LookPath("metaflac"); e == nil {
+			Config.MetaflacPath = p
+		} else {
+			Config.MetaflacPath = "metaflac"
+		}
+	}
+	if Config.Mp4decryptPath == "" {
+		if p, e := exec.LookPath("mp4decrypt"); e == nil {
+			Config.Mp4decryptPath = p
+		} else {
+			Config.Mp4decryptPath = "mp4decrypt"
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "[CONFIG] MP4Box=%q ffmpeg=%q metaflac=%q mp4decrypt=%q\n",
+		Config.Mp4boxPath, Config.FfmpegPath, Config.MetaflacPath, Config.Mp4decryptPath)
 	return nil
 }
 
@@ -734,7 +790,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, discTrackC
 			counter.Success++
 			return
 		}
-		if _, err := exec.LookPath("mp4decrypt"); err != nil {
+		if _, err := exec.LookPath(Config.Mp4decryptPath); err != nil {
 			fmt.Fprintln(os.Stderr, "mp4decrypt is not found, skip MV dl")
 			counter.Success++
 			return
@@ -954,10 +1010,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, discTrackC
 		}
 	}
 
-	tags := []string{
-		"tool=",
-		"artist=AppleMusic",
-	}
+	cmdArgs := []string{"-itags", "tool=:", "-itags", "artist=AppleMusic"}
 	if Config.EmbedCover {
 		if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 			track.CoverPath, err = writeCover(track.SaveDir, track.ID, track.Resp.Attributes.Artwork.URL)
@@ -965,11 +1018,12 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, discTrackC
 				fmt.Fprintln(os.Stderr, "Failed to write cover.")
 			}
 		}
-		tags = append(tags, fmt.Sprintf("cover=%s", track.CoverPath))
+		cmdArgs = append(cmdArgs, "-itags", fmt.Sprintf("cover=%s", track.CoverPath))
 	}
-	tagsString := strings.Join(tags, ":")
-	cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
-	if err := cmd.Run(); err != nil {
+	cmdArgs = append(cmdArgs, trackPath)
+	cmd := exec.Command(Config.Mp4boxPath, cmdArgs...)
+	cmd.Dir = filepath.Dir(trackPath)
+	if err := runCommand("mp4box-embed", cmd); err != nil {
 		fmt.Fprintf(os.Stderr, "Embed failed: %v\n", err)
 		counter.Error++
 		return
@@ -981,6 +1035,41 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, discTrackC
 		fmt.Fprintf(os.Stderr, "⚠️ Failed to write tags in media %v", err)
 		counter.Unavailable++
 		return
+	}
+
+	fixCmd := exec.Command(Config.Mp4boxPath, "-add", trackPath, "-new", trackPath)
+	fixCmd.Dir = filepath.Dir(trackPath)
+	if err := runCommand("mp4box-fix", fixCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "MP4Box fix failed: %v\n", err)
+		counter.Error++
+		return
+	}
+
+	if Config.FlacOutput && track.Codec == "ALAC" {
+		flacPath := strings.TrimSuffix(trackPath, ".m4a") + ".flac"
+
+		fmt.Fprintln(os.Stderr, "Transcoding to FLAC...")
+		transcodeCmd := exec.Command(Config.FfmpegPath, "-y", "-i", trackPath, "-c:a", "flac", "-compression_level", fmt.Sprintf("%d", Config.FlacCompressionLevel), flacPath)
+		if err := runCommand("ffmpeg-flac", transcodeCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "FLAC transcoding failed: %v\n", err)
+			counter.Error++
+			return
+		}
+
+		coverPath := ""
+		if Config.EmbedCover {
+			coverPath = track.CoverPath
+		}
+		err = writeFlacTags(flacPath, track, lrc, coverPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "⚠️ Failed to write FLAC tags: %v", err)
+			counter.Unavailable++
+			return
+		}
+
+		os.Remove(trackPath)
+		track.SavePath = flacPath
+		track.SaveName = filepath.Base(flacPath)
 	}
 
 	if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
@@ -1332,10 +1421,10 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 			if err == nil {
 				exists, _ := fileExists(filepath.Join(playlistFolderPath, "squareanimatedartwork.mp4"))
 				if !exists {
-					cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i",
+					cmd := exec.Command(Config.FfmpegPath, "-loglevel", "quiet", "-y", "-i",
 						motionvideoUrlSquare, "-c", "copy",
 						filepath.Join(playlistFolderPath, "squareanimatedartwork.mp4"))
-					cmd.Run()
+					runCommand("ffmpeg-anim-square", cmd)
 				}
 			}
 		}
@@ -1345,10 +1434,10 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 			if err == nil {
 				exists, _ := fileExists(filepath.Join(playlistFolderPath, "tallanimatedartwork.mp4"))
 				if !exists {
-					cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i",
+					cmd := exec.Command(Config.FfmpegPath, "-loglevel", "quiet", "-y", "-i",
 						motionvideoUrlTall, "-c", "copy",
 						filepath.Join(playlistFolderPath, "tallanimatedartwork.mp4"))
-					cmd.Run()
+					runCommand("ffmpeg-anim-tall-pl", cmd)
 				}
 			}
 		}
@@ -1629,16 +1718,16 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		if err == nil {
 			exists, _ := fileExists(filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
 			if !exists {
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
-				cmd.Run()
+				cmd := exec.Command(Config.FfmpegPath, "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
+				runCommand("ffmpeg-anim-square-album", cmd)
 			}
 		}
 		motionvideoUrlTall, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
 		if err == nil {
 			exists, _ := fileExists(filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
 			if !exists {
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
-				cmd.Run()
+				cmd := exec.Command(Config.FfmpegPath, "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
+				runCommand("ffmpeg-anim-tall-album", cmd)
 			}
 		}
 	}
@@ -1927,6 +2016,51 @@ func writeMP4Tags(track *task.Track, lrc string, discTrackCounts map[int]int) er
 	return nil
 }
 
+func writeFlacTags(flacPath string, track *task.Track, lrc string, coverPath string) error {
+	tags := []string{
+		"TITLE=" + track.Resp.Attributes.Name,
+		"ARTIST=" + track.Resp.Attributes.ArtistName,
+		"ALBUM=" + track.Resp.Attributes.AlbumName,
+		"TRACKNUMBER=" + strconv.Itoa(track.Resp.Attributes.TrackNumber),
+		"DISCNUMBER=" + strconv.Itoa(track.Resp.Attributes.DiscNumber),
+	}
+
+	if track.Resp.Attributes.GenreNames != nil && len(track.Resp.Attributes.GenreNames) > 0 {
+		tags = append(tags, "GENRE="+track.Resp.Attributes.GenreNames[0])
+	}
+	if track.Resp.Attributes.ComposerName != "" {
+		tags = append(tags, "COMPOSER="+track.Resp.Attributes.ComposerName)
+	}
+	if track.Resp.Attributes.Isrc != "" {
+		tags = append(tags, "ISRC="+track.Resp.Attributes.Isrc)
+	}
+	if track.Resp.Attributes.ReleaseDate != "" {
+		tags = append(tags, "DATE="+track.Resp.Attributes.ReleaseDate)
+	}
+
+	tagsContent := strings.Join(tags, "\n")
+	cmd := exec.Command(Config.MetaflacPath, "--import-tags-from=-", flacPath)
+	if err := runCommandStdin("metaflac-tags", cmd, tagsContent); err != nil {
+		return err
+	}
+
+	if coverPath != "" {
+		coverCmd := exec.Command(Config.MetaflacPath, "--import-picture-from="+coverPath, flacPath)
+		if err := runCommand("metaflac-cover", coverCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to embed cover in FLAC: %v\n", err)
+		}
+	}
+
+	if lrc != "" {
+		lrcCmd := exec.Command(Config.MetaflacPath, "--import-tags-from=-", flacPath)
+		if err := runCommandStdin("metaflac-lyrics", lrcCmd, "LYRICS:"+lrc); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to embed lyrics in FLAC: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
 func mvDownloader(adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track, progressWriter *bufio.Writer) error {
 	MVInfo, err := ampapi.GetMusicVideoResp(storefront, adamID, Config.Language, token)
 	if err != nil {
@@ -2097,7 +2231,7 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 
 	remuxDone := make(chan error, 1)
 	go func() {
-		muxCmd := exec.Command("MP4Box", "-itags", tagsString, "-quiet", "-add", vidPath, "-add", audPath, "-keep-utc", "-new", mvOutPath)
+		muxCmd := exec.Command(Config.Mp4boxPath, "-itags", tagsString, "-quiet", "-add", vidPath, "-add", audPath, "-keep-utc", "-new", mvOutPath)
 		remuxDone <- muxCmd.Run()
 	}()
 
@@ -2390,6 +2524,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load Config failed: %v\n", err)
 		return
 	}
+	runv3.SetMp4decryptPath(Config.Mp4decryptPath)
 	token, err := ampapi.GetToken()
 	if err != nil {
 		if Config.AuthorizationToken != "" && Config.AuthorizationToken != "your-authorization-token" {
@@ -2445,6 +2580,7 @@ func main() {
 	flag.BoolVar(&Config.UseSongInfoForPlaylist, "use-songinfo-for-playlist", Config.UseSongInfoForPlaylist, "Use song info for playlist")
 	flag.BoolVar(&Config.DlAlbumcoverForPlaylist, "dl-albumcover-for-playlist", Config.DlAlbumcoverForPlaylist, "Download album cover for playlist")
 	flag.StringVar(&Config.Storefront, "storefront", Config.Storefront, "Storefront")
+	flag.IntVar(&Config.FlacCompressionLevel, "flac-compression-level", Config.FlacCompressionLevel, "FLAC compression level")
 
 	flag.Parse()
 
